@@ -93,7 +93,8 @@ class RLTrainer:
     """
     for _ in range(n_epochs):
       self._epoch += 1
-      cur_time = time.time()
+
+      epoch_time = cur_time = time.time()
       self.train_epoch()
       print('RL training took %.2f seconds.' % (time.time() - cur_time))
       cur_time = time.time()
@@ -105,6 +106,8 @@ class RLTrainer:
       print('Average return in epoch %d was %.2f.' % (self._epoch, avg_return))
       if self._sw is not None:
         self._sw.scalar('timing/collect', time.time() - cur_time,
+                        step=self._epoch)
+        self._sw.scalar('timing/epoch', time.time() - epoch_time,
                         step=self._epoch)
         self._sw.scalar('rl/avg_return', avg_return, step=self._epoch)
         self._sw.flush()
