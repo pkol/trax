@@ -32,7 +32,7 @@ class Distribution:
     """Returns the number of inputs to the distribution (i.e. parameters)."""
     raise NotImplementedError
 
-  def sample(self, inputs):
+  def sample(self, inputs, temperature=1.0):
     """Samples a point from the distribution.
 
     Args:
@@ -41,6 +41,8 @@ class Distribution:
         distribution parameter shape is (C,), where C is the number of
         categories. If (B, C) is passed, the object will represent a batch of B
         categorical distributions with different parameters.
+      temperature: sampling temperature; 1.0 is default, at 0.0 chooses
+        the most probable (preferred) action.
 
     Returns:
       Sampled point of shape dependent on the subclass and on the shape of
@@ -74,18 +76,15 @@ class Distribution:
 class Categorical(Distribution):
   """Categorical distribution parametrized by logits."""
 
-  def __init__(self, n_categories, shape=(), temperature=1.0):
+  def __init__(self, n_categories, shape=()):
     """Initializes Categorical distribution.
 
     Args:
       n_categories (int): Number of categories.
       shape (tuple): Shape of the sample.
-      temperature (float): Sampling temperature. During training, logits are
-        divided by this number.
     """
     self._n_categories = n_categories
     self._shape = shape
-    self._temperature = temperature
 
   @property
   def n_inputs(self):
@@ -96,16 +95,15 @@ class Categorical(Distribution):
         inputs, inputs.shape[:-1] + self._shape + (self._n_categories,)
     )
 
-  def sample(self, inputs):
+  def sample(self, inputs, temperature=1.0):
     # No need for LogSoftmax with Gumbel sampling - softmax normalization is
     # subtracting a constant from every logit, and Gumbel sampling is taking
     # a max over logits plus noise, so invariant to adding a constant.
-    return tl.gumbel_sample(
-        self._unflatten_inputs(inputs), temperature=self._temperature
-    )
+    if temperature == 0.0:
+      return np.argmax(self._unflatten_inputs(inputs), axis=-1)
+    return tl.gumbel_sample(self._unflatten_inputs(inputs), temperature)
 
   def log_prob(self, inputs, point):
-    inputs /= self._temperature
     inputs = tl.LogSoftmax()(self._unflatten_inputs(inputs))
     return np.sum(
         # Select the logits specified by point.
@@ -113,6 +111,10 @@ class Categorical(Distribution):
         # Sum over the parameter dimensions.
         axis=[-a for a in range(1, len(self._shape) + 2)],
     )
+
+  def entropy(self, log_probs):
+    probs = np.exp(log_probs)
+    return -np.sum(probs * log_probs, axis=-1)
 
 
 @gin.configurable(blacklist=['shape'])
@@ -133,10 +135,10 @@ class Gaussian(Distribution):
   def n_inputs(self):
     return np.prod(self._shape, dtype=np.int32)
 
-  def sample(self, inputs):
+  def sample(self, inputs, temperature=1.0):
     return onp.random.normal(
         loc=np.reshape(inputs, inputs.shape[:-1] + self._shape),
-        scale=self._std,
+        scale=self._std * temperature,
     )
 
   def log_prob(self, inputs, point):
@@ -147,6 +149,11 @@ class Gaussian(Distribution):
         # Normalizing constant.
         (np.log(self._std) + np.log(np.sqrt(2 * np.pi))) * np.prod(self._shape)
     )
+
+  # At that point self._std is not learnable, hence
+  # we return a constaent
+  def entropy(self):
+    return np.exp(self._std) + .5 * np.log(2.0 * np.pi * np.e)
 
 
 # TODO(pkozakowski): Implement GaussianMixture.

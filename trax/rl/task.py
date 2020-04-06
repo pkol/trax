@@ -17,10 +17,11 @@
 """Classes for defining RL tasks in Trax."""
 
 import collections
+import pickle
 import gin
 import gym
 import numpy as np
-
+import tensorflow as tf
 
 
 class _TimeStep(object):
@@ -117,10 +118,10 @@ class Trajectory(object):
   def _default_timestep_to_np(self, ts):
     """Default way to convert timestep to numpy."""
     if ts.action is None:
-      return (np.array(ts.observation, dtype=np.float32),
+      return (np.array(ts.observation),
               None, None, None, None)
-    return (np.array(ts.observation, dtype=np.float32),
-            np.array(ts.action, dtype=np.int32),
+    return (np.array(ts.observation),
+            np.array(ts.action),
             np.array(ts.log_prob, dtype=np.float32),
             np.array(ts.reward, dtype=np.float32),
             np.array(ts.discounted_return, dtype=np.float32))
@@ -182,7 +183,6 @@ def play(env, policy, dm_suite=False, max_steps=None):
       cur_trajectory.extend(action, log_prob,
                             observation.reward,
                             observation.observation)
-                            # observation.observation.squeeze())
       cur_step += 1
       terminal = observation.step_type.last()
   else:
@@ -203,8 +203,10 @@ def _zero_pad(x, pad, axis):
                 constant_values=x.dtype.type(0))
 
 
-def _random_policy(n_actions):
-  return lambda _: (np.random.randint(n_actions), np.log(1 / float(n_actions)))
+def _random_policy(action_space):
+  # TODO(pkozakowski): Make returning the log probabilities optional.
+  # Returning 1 as a log probability is a temporary hack.
+  return lambda _: (action_space.sample(), 1.0)
 
 
 def _sample_proportionally(inputs, weights):
@@ -252,6 +254,7 @@ class RLTask:
 
     """
     if isinstance(env, str):
+      self._env_name = env
       if dm_suite:
         env = environments.load_from_settings(
             platform='atari',
@@ -263,6 +266,8 @@ class RLTask:
         env = atari_wrapper.AtariWrapper(environment=env, num_stacked_frames=1)
       else:
         env = gym.make(env)
+    else:
+      self._env_name = type(env).__name__
     self._env = env
     self._dm_suite = dm_suite
     self._max_steps = max_steps
@@ -270,7 +275,7 @@ class RLTask:
     # TODO(lukaszkaiser): find a better way to pass initial trajectories,
     # whether they are an explicit list, a file, or a number of random ones.
     if isinstance(initial_trajectories, int):
-      initial_trajectories = [self.play(_random_policy(self.n_actions))
+      initial_trajectories = [self.play(_random_policy(self.action_space))
                               for _ in range(initial_trajectories)]
     if isinstance(initial_trajectories, list):
       initial_trajectories = {0: initial_trajectories}
@@ -287,6 +292,10 @@ class RLTask:
     return self._env
 
   @property
+  def env_name(self):
+    return self._env_name
+
+  @property
   def max_steps(self):
     return self._max_steps
 
@@ -297,18 +306,10 @@ class RLTask:
   @property
   def action_space(self):
     if self._dm_suite:
-      return gym.spaces.Discrete(self.n_actions)
+      return gym.spaces.Discrete(self._env.action_spec().num_values)
     else:
       return self._env.action_space
 
-  @property
-  def n_actions(self):
-    if self._dm_suite:
-      return self._env.action_spec().num_values
-    else:
-      return self._env.action_space.n
-
-  @property
   def observation_shape(self):
     if self._dm_suite:
       return self._env.observation_spec().shape
@@ -326,6 +327,20 @@ class RLTask:
   @timestep_to_np.setter
   def timestep_to_np(self, ts):
     self._timestep_to_np = ts
+
+  def init_from_file(self, file_name):
+    with tf.io.gfile.GFile(file_name, 'rb') as f:
+      dictionary = pickle.load(f)
+    self._trajectories = dictionary['trajectories']
+    self._max_steps = dictionary['max_steps']
+    self._gamma = dictionary['gamma']
+
+  def save_to_file(self, file_name):
+    dictionary = {'trajectories': self._trajectories,
+                  'max_steps': self._max_steps,
+                  'gamma': self._gamma}
+    with tf.io.gfile.GFile(file_name, 'wb') as f:
+      pickle.dump(dictionary, f)
 
   def play(self, policy):
     """Play an episode in env taking actions according to the given policy."""
@@ -442,8 +457,6 @@ class RLTask:
         # [batch_size, trajectory_length-1], which we call [B, L-1].
         # Observations are more complex and will usuall be [B, L] + S where S
         # is the shape of the observation space (self.observation_shape).
-        # yield TrajectoryNp(pad(obs), pad(act), pad(logp), pad(rew), pad(ret),
-        #                    pad([np.ones_like(a) for a in act]))
         yield TrajectoryNp(
             pad(obs), pad(act), pad(logp), pad(rew), pad(ret),
             pad([np.ones(a.shape[:1]) for a in act]))

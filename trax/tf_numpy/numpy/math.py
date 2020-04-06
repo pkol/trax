@@ -19,7 +19,6 @@ from __future__ import division
 from __future__ import print_function
 
 import sys
-from absl import logging
 
 import numpy as np
 import six
@@ -33,53 +32,17 @@ from trax.tf_numpy.numpy import dtypes
 from trax.tf_numpy.numpy import utils
 
 
-def dot(a, b):
-  """The dot product of two arrays. See numpy.dot for more details.
-
-  This relies on `tf.tensordot` which does not support types int64 and float64.
-  So arrays of those types are "unsafely" cast to int32 and float32.
-
-  Args:
-    a: array_like. Could be an ndarray, a Tensor or any object that can
-      be converted to a Tensor using `tf.convert_to_tensor`.
-    b: array_like. Could be an ndarray, a Tensor or any object that can
-      be converted to a Tensor using `tf.convert_to_tensor`.
-
-  Returns:
-    An ndarray.
-  """
-  a, b = array_creation._promote_dtype(a, b)
-  if utils.isscalar(a) or utils.isscalar(b):
-    a = utils.tensor_to_ndarray(tf.expand_dims(a.data, -1))
-    b = utils.tensor_to_ndarray(tf.expand_dims(b.data, -1))
-    a_axis = b_axis = -1
-  else:
-    a_axis = -1
-    # TODO(agarwal): handle ndim being None when in graph mode.
-    b_axis = -2 if b.ndim > 1 else -1
-  # TODO(srbs): When the shape of the output is a scalar e.g. when performing
-  # a dot-product of two vectors, numpy returns a scalar object and not an
-  # instance of ndarray.
-
-  # tensordot/MatMul does not support int64 and float64 so we manually cast to
-  # the compatible types. The conversion may be unsafe.
-  # TODO(srbs): Figure out why MatMul does not support larger types.
-  output_type = None
-  if a.dtype == np.int64:
-    logging.warning("Unsafe cast to int32.")
-    a = utils.tensor_to_ndarray(tf.cast(a.data, tf.int32))
-    b = utils.tensor_to_ndarray(tf.cast(b.data, tf.int32))
-    output_type = tf.int64
-  elif a.dtype == np.float64:
-    logging.warning("Unsafe cast to float32.")
-    a = utils.tensor_to_ndarray(tf.cast(a.data, tf.float32))
-    b = utils.tensor_to_ndarray(tf.cast(b.data, tf.float32))
-    output_type = tf.float64
-
-  result_t = tf.tensordot(a.data, b.data, [[a_axis], [b_axis]])
-  if output_type:
-    result_t = tf.cast(result_t, output_type)
-  return utils.tensor_to_ndarray(result_t)
+@utils.np_doc_only(np.dot)
+def dot(a, b):  # pylint: disable=missing-docstring
+  def f(a, b):  # pylint: disable=missing-docstring
+    return utils.cond(
+        utils.logical_or(tf.rank(a) == 0, tf.rank(b) == 0),
+        lambda: a * b,
+        lambda: utils.cond(  # pylint: disable=g-long-lambda
+            tf.rank(b) == 1,
+            lambda: tf.tensordot(a, b, axes=[[-1], [-1]]),
+            lambda: tf.tensordot(a, b, axes=[[-1], [-2]])))
+  return _bin_op(f, a, b)
 
 
 # TODO(wangpeng): Make element-wise ops `ufunc`s
@@ -207,6 +170,20 @@ def matmul(x1, x2):  # pylint: disable=missing-docstring
   return _bin_op(f, x1, x2)
 
 
+@utils.np_doc(np.tensordot)
+def tensordot(a, b, axes=2):
+  return _bin_op(lambda a, b: tf.tensordot(a, b, axes=axes), a, b)
+
+
+@utils.np_doc_only(np.inner)
+def inner(a, b):
+  def f(a, b):
+    return utils.cond(utils.logical_or(tf.rank(a) == 0, tf.rank(b) == 0),
+                      lambda: a * b,
+                      lambda: tf.tensordot(a, b, axes=[[-1], [-1]]))
+  return _bin_op(f, a, b)
+
+
 @utils.np_doc(np.power)
 def power(x1, x2):
   return _bin_op(tf.math.pow, x1, x2)
@@ -241,7 +218,11 @@ def hypot(x1, x2):
 
 
 def _pad_left_to(n, old_shape):
-  return (1,) * (n - len(old_shape)) + old_shape
+  old_shape = array_creation.asarray(old_shape, dtype=np.int32).data
+  new_shape = tf.pad(
+      old_shape, [[tf.math.maximum(n - tf.size(old_shape), 0), 0]],
+      constant_values=1)
+  return array_creation.asarray(new_shape)
 
 
 @utils.np_doc(np.kron)
@@ -738,10 +719,13 @@ def _atleast_nd(n, new_shape, *arys):
     The reshaped array(s).
   """
   def f(x):
+    # pylint: disable=g-long-lambda
     x = array_creation.asarray(x)
-    if x.ndim < n:
-      x = array_methods.reshape(x, new_shape(n, x.shape))
-    return x
+    return array_creation.asarray(
+        utils.cond(
+            utils.greater(n, tf.rank(x)), lambda: array_methods.reshape(
+                x, new_shape(n, tf.shape(x.data))).data, lambda: x.data))
+
   arys = list(map(f, arys))
   if len(arys) == 1:
     return arys[0]
@@ -760,14 +744,17 @@ def atleast_2d(*arys):
 
 
 @utils.np_doc(np.atleast_3d)
-def atleast_3d(*arys):
+def atleast_3d(*arys):  # pylint: disable=missing-docstring
+
   def new_shape(_, old_shape):
-    ndim = len(old_shape)
-    if ndim == 0:
-      return (1, 1, 1)
-    elif ndim == 1:
-      return (1,) + old_shape + (1,)
-    return old_shape + (1,)
+    # pylint: disable=g-long-lambda
+    ndim = tf.size(old_shape)
+    return utils.cond(
+        ndim == 0, lambda: tf.constant([1, 1, 1], dtype=tf.int32),
+        lambda: utils.cond(
+            ndim == 1, lambda: tf.pad(old_shape, [[1, 1]], constant_values=1),
+            lambda: tf.pad(old_shape, [[0, 1]], constant_values=1)))
+
   return _atleast_nd(3, new_shape, *arys)
 
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import trax.layers
 import trax.lr_schedules
 import trax.models
 import trax.optimizers
@@ -20,48 +19,56 @@ import trax.rl
 
 # Parameters for Policy:
 # ==============================================================================
-Policy.body = @trax.models.AtariCnnBody
+Policy.body = @trax.models.TransformerDecoder
 
 # Parameters for Value:
 # ==============================================================================
-Value.body = @trax.models.AtariCnnBody
+Value.body = @trax.models.TransformerDecoder
 
-# Parameters for the AtariCnnBody:
+# Parameters for TransformerDecoder:
 # ==============================================================================
-AtariCnnBody.kernel_initializer = @trax.layers.AtariConvInit
-
+TransformerDecoder.vocab_size = None
+TransformerDecoder.d_model = 64
+TransformerDecoder.d_ff = 128
+TransformerDecoder.n_layers = 2
+TransformerDecoder.n_heads = 2
+		       
 # Parameters for MultifactorSchedule:
 # ==============================================================================
-value/MultifactorSchedule.constant = 0.0001
-value/MultifactorSchedule.factors = 'constant'
-policy/MultifactorSchedule.constant = 0.0001
-policy/MultifactorSchedule.factors = 'constant'
+MultifactorSchedule.constant = 0.001
+MultifactorSchedule.factors = 'constant'
 
 # Parameters for RLTask:
 # ==============================================================================
-RLTask.env = "boxing"
-RLTask.initial_trajectories = 100
+RLTask.env = "CartPole-v0"
+RLTask.initial_trajectories = 1000
 RLTask.gamma = 0.99
 RLTask.max_steps = 200
-RLTask.dm_suite = True
 
-# Parameters for PPOTrainer:
+# Parameters for AWRTrainer:
 # ==============================================================================
-PPOTrainer.n_shared_layers=0
-PPOTrainer.value_model = @trax.models.Value
-PPOTrainer.value_optimizer = @trax.optimizers.Adam
-PPOTrainer.value_batch_size = 4
-PPOTrainer.value_train_steps_per_epoch = 10
-PPOTrainer.value_lr_schedule = @value/MultifactorSchedule
-PPOTrainer.policy_model = @trax.models.Policy
-PPOTrainer.policy_optimizer = @trax.optimizers.Adam
-PPOTrainer.policy_batch_size = 4
-PPOTrainer.policy_train_steps_per_epoch = 10
-PPOTrainer.policy_lr_schedule = @policy/MultifactorSchedule
-PPOTrainer.collect_per_epoch = 50
+AWRTrainer.value_model = @trax.models.Value
+AWRTrainer.value_optimizer = @trax.optimizers.Adam
+AWRTrainer.value_batch_size = 32
+AWRTrainer.value_train_steps_per_epoch = 200
+AWRTrainer.value_lr_schedule = @value/MultifactorSchedule
+AWRTrainer.value_evals_per_epoch = 2
+AWRTrainer.value_eval_steps = 1
+AWRTrainer.policy_model = @trax.models.Policy
+AWRTrainer.policy_optimizer = @trax.optimizers.Adam
+AWRTrainer.policy_batch_size = 32
+AWRTrainer.policy_train_steps_per_epoch = 500
+AWRTrainer.policy_lr_schedule = @policy/MultifactorSchedule
+AWRTrainer.policy_evals_per_epoch = 2
+AWRTrainer.policy_eval_steps = 1
+AWRTrainer.collect_per_epoch = 200
+AWRTrainer.beta = 1.0
+AWRTrainer.w_max = 20
+AWRTrainer.max_slice_length = 128
+AWRTrainer.added_policy_slice_length = 1
 
 # Parameters for train_rl:
 # ==============================================================================
 train_rl.light_rl = True
-train_rl.light_rl_trainer = @trax.rl.PPOTrainer
-train_rl.n_epochs = 5000
+train_rl.light_rl_trainer = @trax.rl.AWRTrainer
+train_rl.n_epochs = 50

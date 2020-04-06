@@ -23,10 +23,9 @@ import tensorflow as tf
 
 from trax import layers as tl
 from trax import lr_schedules as lr
-from trax import shapes
 from trax import supervised
 from trax.math import numpy as jnp
-from trax.rl import computation_utils
+from trax.rl import advantages as rl_advantages
 from trax.rl import training as rl_training
 
 
@@ -46,6 +45,8 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
                value_lr_schedule=lr.MultifactorSchedule,
                value_batch_size=64,
                value_train_steps_per_epoch=500,
+               value_evals_per_epoch=1,
+               value_eval_steps=1,
                n_shared_layers=0,
                added_policy_slice_length=0,
                **kwargs):  # Arguments of PolicyTrainer come here.
@@ -59,6 +60,10 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
       value_batch_size: batch size for value model training
       value_train_steps_per_epoch: how many steps are we using to
         train the value model in each epoch
+      value_evals_per_epoch: number of value trainer evaluations per RL
+          epoch - only affects metric reporting.
+      value_eval_steps: number of value trainer steps per evaluation -
+          only affects metric reporting.
       n_shared_layers: how many layers to share between value and
         policy models
       added_policy_slice_length: how much longer should slices of
@@ -71,6 +76,8 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
     self._n_shared_layers = n_shared_layers
     self._value_batch_size = value_batch_size
     self._value_train_steps_per_epoch = value_train_steps_per_epoch
+    self._value_evals_per_epoch = value_evals_per_epoch
+    self._value_eval_steps = value_eval_steps
 
     # The 2 below will be initalized in super.__init__ anyway, but are needed
     # to construct value batches which are needed before PolicyTrainer init
@@ -106,8 +113,13 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
 
   def value_batches_stream(self):
     """Use the RLTask self._task to create inputs to the value model."""
+    if self.on_policy:
+      epochs = [-1]
+    else:
+      epochs = None
     for np_trajectory in self._task.trajectory_batch_stream(
-        self._value_batch_size, max_slice_length=self._max_slice_length):
+        self._value_batch_size, max_slice_length=self._max_slice_length,
+        epochs=epochs):
       # Insert an extra depth dimension, so the target shape is consistent with
       # the network output shape.
       yield (np_trajectory.observations,         # Inputs to the value model.
@@ -141,22 +153,34 @@ class ActorCriticTrainer(rl_training.PolicyTrainer):
         self._policy_batch_size,
         epochs=epochs,
         max_slice_length=max_slice_length,
-        include_final_state=(max_slice_length > 1)):
+        include_final_state=False):
       value_model = self._value_eval_model
       value_model.weights = self._value_trainer.model_weights
       values = value_model(np_trajectory.observations, n_accelerators=1)
-      shapes.assert_shape_equals(
-          values, (self._policy_batch_size, max_slice_length, 1))
       values = np.squeeze(values, axis=2)  # Remove the singleton depth dim.
+      if len(values.shape) != 2:
+        raise ValueError('Values are expected to have shape ' +
+                         '[batch_size, length], got: %s' % str(values.shape))
+      if values.shape[0] != self._policy_batch_size:
+        raise ValueError('Values first dimension should = policy batch size, ' +
+                         '%d != %d' %(values.shape[0], self._policy_batch_size))
       yield self.policy_inputs(np_trajectory, values)
 
   def train_epoch(self):
     """Trains RL for one epoch."""
-    self._value_trainer.train_epoch(self._value_train_steps_per_epoch, 1)
+    for _ in range(self._value_evals_per_epoch):
+      self._value_trainer.train_epoch(
+          self._value_train_steps_per_epoch // self._value_evals_per_epoch,
+          self._value_eval_steps,
+      )
     if self._n_shared_layers > 0:  # Copy value weights to policy trainer.
       _copy_model_weights(0, self._n_shared_layers,
                           self._value_trainer, self._policy_trainer)
-    self._policy_trainer.train_epoch(self._policy_train_steps_per_epoch, 1)
+    for _ in range(self._policy_evals_per_epoch):
+      self._policy_trainer.train_epoch(
+          self._policy_train_steps_per_epoch // self._policy_evals_per_epoch,
+          self._policy_eval_steps,
+      )
     if self._n_shared_layers > 0:  # Copy policy weights to value trainer.
       _copy_model_weights(0, self._n_shared_layers,
                           self._policy_trainer, self._value_trainer)
@@ -190,56 +214,88 @@ def _copy_model_weights(start, end, from_trainer, to_trainer,  # pylint: disable
 ### Implementations of common actor-critic algorithms.
 
 
-# A2C is one of the most basic actor-critic RL algorithms.
-@tl.layer(n_in=4, n_out=1)
-def A2CLoss(x, log_prob_fn, **unused_kwargs):
-  """Definition of the Advantage Actor Critic (A2C) loss."""
-  (predictions, actions, advantages, old_log_probs) = x
-  del old_log_probs  # Not used in A2C.
-  action_log_probs = log_prob_fn(predictions, actions)
-  return -(action_log_probs * advantages).mean()
+class AdvantageBasedActorCriticTrainer(ActorCriticTrainer):
+  """Base class for advantage-based actor-critic algorithms."""
 
-
-class A2CTrainer(ActorCriticTrainer):
-  """Trains policy and value models using the A2C algortithm."""
-
-  on_policy = True
+  def __init__(
+      self, task, advantage_estimator=rl_advantages.td_lambda, **kwargs
+  ):
+    self._advantage_estimator = advantage_estimator
+    super(AdvantageBasedActorCriticTrainer, self).__init__(task, **kwargs)
 
   def policy_inputs(self, trajectory, values):
     """Create inputs to policy model from a TrajectoryNp and values."""
     # How much TD to use is determined by the added policy slice length,
     # as the policy batches need to be this much longer to calculate TD.
-    td = self._added_policy_slice_length
-    advantages = computation_utils.calculate_advantage(
-        trajectory.rewards, trajectory.returns, values, self._task.gamma, td)
+    advantages = self._advantage_estimator(
+        trajectory.rewards, trajectory.returns, values,
+        gamma=self._task.gamma,
+        n_extra_steps=self._added_policy_slice_length,
+    )
     # Observations should be the same length as advantages - so if we are
-    # using td_advantage, we need to cut td-many out from the end.
-    obs = trajectory.observations
-    obs = obs[:, :-td] if td > 0 else obs
-    act = trajectory.actions
-    act = act[:, :-td] if td > 0 else act
-    old_logps = trajectory.log_probs
-    old_logps = old_logps[:, :-td] if td > 0 else old_logps
-    assert len(advantages.shape) == 2  # [batch_size, length]
-    assert act.shape[0:2] == advantages.shape
-    assert obs.shape[0:2] == advantages.shape
-    assert old_logps.shape == advantages.shape
-    return (obs, act, advantages, old_logps)
+    # using n_extra_steps, we need to trim the length to match.
+    obs = trajectory.observations[:, :advantages.shape[1]]
+    act = trajectory.actions[:, :advantages.shape[1]]
+    old_logps = trajectory.log_probs[:, :advantages.shape[1]]
+    mask = trajectory.mask[:, :advantages.shape[1]]  # Mask to zero-out padding.
+    # Shape checks to help debugging.
+    if len(advantages.shape) != 2:
+      raise ValueError('Advantages are expected to have shape ' +
+                       '[batch_size, length], got: %s' % str(advantages.shape))
+    if act.shape[0:2] != advantages.shape:
+      raise ValueError('First 2 dimensions of actions should be the same as in '
+                       'advantages, %s != %s' % (act.shape[0:2],
+                                                 advantages.shape))
+    if obs.shape[0:2] != advantages.shape:
+      raise ValueError('First 2 dimensions of observations should be the same '
+                       'as in advantages, %s != %s' % (obs.shape[0:2],
+                                                       advantages.shape))
+    if old_logps.shape != advantages.shape:
+      raise ValueError('Old log-probs and advantages shapes should be the same'
+                       ', %s != %s' % (old_logps.shape, advantages.shape))
+    if mask.shape != advantages.shape:
+      raise ValueError('Mask and advantages shapes should be the same'
+                       ', %s != %s' % (mask.shape, advantages.shape))
+    return (obs, act, advantages, old_logps, mask)
 
   @property
-  def policy_loss(self):
+  def policy_loss_given_log_probs(self):
+    """Policy loss given action log-probabilities."""
+    raise NotImplementedError
+
+  def policy_loss(self, **unused_kwargs):
     """Policy loss."""
-    return functools.partial(
-        A2CLoss, log_prob_fn=self._policy_dist.log_prob)
+    return tl.Serial([
+        self._policy_dist.LogProb(),
+        self.policy_loss_given_log_probs(),
+    ])
+
+
+# A2C is one of the most basic actor-critic RL algorithms.
+@tl.layer(n_in=4, n_out=1)
+def A2CLoss(x, **unused_kwargs):
+  """Definition of the Advantage Actor Critic (A2C) loss."""
+  (log_probs, advantages, old_log_probs, mask) = x
+  del old_log_probs  # Not used in A2C.
+  return -np.sum(log_probs * advantages * mask) / np.sum(mask)
+
+
+class A2CTrainer(AdvantageBasedActorCriticTrainer):
+  """Trains policy and value models using the A2C algortithm."""
+
+  on_policy = True
+
+  @property
+  def policy_loss_given_log_probs(self):
+    """Policy loss."""
+    return A2CLoss
 
 
 # PPO is a widely used actor-critic RL algorithm.
 @tl.layer(n_in=4, n_out=1)
-def PPOLoss(x, distribution, epsilon, **unused_kwargs):
+def PPOLoss(x, epsilon, **unused_kwargs):
   """Definition of the Proximal Policy Optimization loss."""
-  (dist_inputs, actions, advantages, old_log_probs) = x
-  new_log_probs = distribution.log_prob(dist_inputs, actions)
-
+  (new_log_probs, advantages, old_log_probs, mask) = x
   # Old log probs have an undesirable extra dimension which we remove here
   old_log_probs = old_log_probs.squeeze(axis=-1)
 
@@ -251,15 +307,16 @@ def PPOLoss(x, distribution, epsilon, **unused_kwargs):
                                1 - epsilon,
                                1 + epsilon) * advantages
   ppo_objective = jnp.minimum(unclipped_objective, clipped_objective)
+  return -np.sum(ppo_objective * mask) / np.sum(mask)
 
-  return -ppo_objective.mean()
 
-
-class PPOTrainer(A2CTrainer):
+class PPOTrainer(AdvantageBasedActorCriticTrainer):
   """The Proximal Policy Optimization Algorithm aka PPO.
 
   Trains policy and value models using the PPO algortithm.
   """
+
+  on_policy = True
 
   def __init__(self, task, epsilon=0.2, **kwargs):
     """Configures the PPO Trainer."""
@@ -267,23 +324,22 @@ class PPOTrainer(A2CTrainer):
     super(PPOTrainer, self).__init__(task, **kwargs)
 
   @property
-  def policy_loss(self):
+  def policy_loss_given_log_probs(self):
     """Policy loss."""
-    return functools.partial(
-        PPOLoss, distribution=self._policy_dist, epsilon=self._epsilon)
+    return functools.partial(PPOLoss, epsilon=self._epsilon)
 
 
-# AWR is an off-policy actor-critic RL algorithms.
+# AWR is an off-policy actor-critic RL algorithm.
 @tl.layer(n_in=4, n_out=1)
-def AWRLoss(x, beta, w_max, log_prob_fn, **unused_kwargs):
+def AWRLoss(x, beta, w_max, **unused_kwargs):
   """Definition of the Advantage Weighted Regression (AWR) loss."""
-  (predictions, actions, advantages, _) = x
-  action_log_probs = log_prob_fn(predictions, actions)
-  awr_weights = jnp.minimum(jnp.exp(advantages / beta), w_max)
-  return -(action_log_probs * awr_weights).mean()
+  (log_probs, advantages, old_log_probs, mask) = x
+  del old_log_probs  # Not used in AWR.
+  weights = jnp.minimum(jnp.exp(advantages / beta), w_max)
+  return -np.sum(log_probs * weights * mask) / np.sum(mask)
 
 
-class AWRTrainer(A2CTrainer):
+class AWRTrainer(AdvantageBasedActorCriticTrainer):
   """Trains policy and value models using AWR."""
 
   on_policy = False
@@ -295,8 +351,6 @@ class AWRTrainer(A2CTrainer):
     super(AWRTrainer, self).__init__(task, **kwargs)
 
   @property
-  def policy_loss(self):
+  def policy_loss_given_log_probs(self):
     """Policy loss."""
-    return functools.partial(
-        AWRLoss, beta=self._beta, w_max=self._w_max,
-        log_prob_fn=self._policy_dist.log_prob)
+    return functools.partial(AWRLoss, beta=self._beta, w_max=self._w_max)

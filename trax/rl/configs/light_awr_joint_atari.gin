@@ -12,56 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import trax.layers
 import trax.lr_schedules
 import trax.models
 import trax.optimizers
 import trax.rl
 
-# Parameters for Policy:
+# Parameters for PolicyAndValue:
 # ==============================================================================
-Policy.body = @trax.models.AtariCnnBody
-
-# Parameters for Value:
-# ==============================================================================
-Value.body = @trax.models.AtariCnnBody
-
-# Parameters for the AtariCnnBody:
-# ==============================================================================
-AtariCnnBody.kernel_initializer = @trax.layers.AtariConvInit
+PolicyAndValue.body = @trax.models.AtariJointCnnBody
 
 # Parameters for MultifactorSchedule:
 # ==============================================================================
-value/MultifactorSchedule.constant = 0.0001
-value/MultifactorSchedule.factors = 'constant'
-policy/MultifactorSchedule.constant = 0.0001
-policy/MultifactorSchedule.factors = 'constant'
+MultifactorSchedule.constant = 0.01
+MultifactorSchedule.factors = 'constant'
 
 # Parameters for RLTask:
 # ==============================================================================
 RLTask.env = "boxing"
-RLTask.initial_trajectories = 100
+RLTask.initial_trajectories = 1000
 RLTask.gamma = 0.99
 RLTask.max_steps = 200
 RLTask.dm_suite = True
 
-# Parameters for PPOTrainer:
+# Parameters for AWRTrainer:
 # ==============================================================================
-PPOTrainer.n_shared_layers=0
-PPOTrainer.value_model = @trax.models.Value
-PPOTrainer.value_optimizer = @trax.optimizers.Adam
-PPOTrainer.value_batch_size = 4
-PPOTrainer.value_train_steps_per_epoch = 10
-PPOTrainer.value_lr_schedule = @value/MultifactorSchedule
-PPOTrainer.policy_model = @trax.models.Policy
-PPOTrainer.policy_optimizer = @trax.optimizers.Adam
-PPOTrainer.policy_batch_size = 4
-PPOTrainer.policy_train_steps_per_epoch = 10
-PPOTrainer.policy_lr_schedule = @policy/MultifactorSchedule
-PPOTrainer.collect_per_epoch = 50
+AWRJointTrainer.joint_model = @trax.models.PolicyAndValue
+AWRJointTrainer.optimizer = @trax.optimizers.Adam
+AWRJointTrainer.batch_size = 32
+AWRJointTrainer.train_steps_per_epoch = 1000
+AWRJointTrainer.lr_schedule = @MultifactorSchedule
+AWRJointTrainer.collect_per_epoch = 10
+AWRJointTrainer.beta = 1.0
+AWRJointTrainer.w_max = 20
+AWRJointTrainer.max_slice_length = 1
 
 # Parameters for train_rl:
 # ==============================================================================
 train_rl.light_rl = True
-train_rl.light_rl_trainer = @trax.rl.PPOTrainer
-train_rl.n_epochs = 5000
+train_rl.light_rl_trainer = @trax.rl.AWRJointTrainer
+train_rl.n_epochs = 10000

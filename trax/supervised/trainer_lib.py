@@ -603,7 +603,6 @@ class Trainer(object):
       self._eval_sw = None
 
 
-
 @gin.configurable(blacklist=['output_dir'])
 def train(output_dir,
           model=gin.REQUIRED,
@@ -699,6 +698,7 @@ def train(output_dir,
       trainer.save_gin()
 
   trainer.log_step('Training done')
+  trainer.close()
   return trainer.state
 
 

@@ -528,14 +528,20 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       if check_dtypes and hasattr(a, "dtype"):
         self.assertEqual(tf.as_dtype(a.dtype), b.dtype)
 
-    if check_incomplete_shape:
-      # Check partial shapes with known ranks
-      specs = [tf.TensorSpec([None] * len(x.shape), x.dtype) for x in args]
-      cfun = npe.jit(fun, input_signature=specs)
-      compiled_ans = cfun(*args)
-      self.assertAllClose(python_ans, compiled_ans, check_dtypes, atol, rtol)
+    # If some argument doesn't have a `dtype` attr (e.g. a Python scalar), we
+    # skip incomplete-shape checks, since shape specs need dtype. It's OK to
+    # skip since the same incomplete-shape checks will run for []-shaped arrays.
+    if check_incomplete_shape and all(hasattr(x, "dtype") for x in args):
+      # Check partial shapes with known ranks.
+      # Numpy scalars (created by e.g. np.int32(5)) have `dtype` but not
+      # `shape`.
+      if all(hasattr(x, "shape") for x in args):
+        specs = [tf.TensorSpec([None] * len(x.shape), x.dtype) for x in args]
+        cfun = npe.jit(fun, input_signature=specs)
+        compiled_ans = cfun(*args)
+        self.assertAllClose(python_ans, compiled_ans, check_dtypes, atol, rtol)
 
-      # Check unknown ranks
+      # Check unknown ranks.
       specs = [tf.TensorSpec(None, x.dtype) for x in args]
       cfun = npe.jit(fun, input_signature=specs)
       compiled_ans = cfun(*args)
@@ -824,7 +830,6 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
           ("matrix-tensor", (5, 2), (3, 2, 4)),
           ("tensor-tensor", (2, 3, 4), (5, 4, 1))]
       for lhs_dtype, rhs_dtype in CombosWithReplacement(number_dtypes, 2)))
-  @disable
   def testDot(self, lhs_shape, lhs_dtype, rhs_shape, rhs_dtype, rng_factory):
     rng = rng_factory()
     args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
@@ -839,7 +844,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(onp_dot, lnp.dot, args_maker, check_dtypes=True,
                             tol=tol)
     self._CompileAndCheck(lnp.dot, args_maker, check_dtypes=True, atol=tol,
-                          rtol=tol)
+                          rtol=tol, check_incomplete_shape=True)
 
   @named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_{}_{}".format(
@@ -894,7 +899,6 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
           [(1, 2, 3, 4), (4, 5, 3, 6), [[2, 3], [2, 0]]],
       ]
       for lhs_dtype, rhs_dtype in CombosWithReplacement(number_dtypes, 2)))
-  @disable
   def testTensordot(self, lhs_shape, lhs_dtype, rhs_shape, rhs_dtype, axes, rng_factory):
     rng = rng_factory()
     args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
@@ -910,7 +914,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       tol[onp.float32] = tol[onp.complex64] = 2e-1
     self._CheckAgainstNumpy(onp_fun, lnp_fun, args_maker, check_dtypes=True,
                             tol=tol)
-    self._CompileAndCheck(lnp_fun, args_maker, check_dtypes=True)
+    self._CompileAndCheck(lnp_fun, args_maker, check_dtypes=True,
+                          check_incomplete_shape=True)
 
   @named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_{}".format(
@@ -925,7 +930,6 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       if len(jtu._dims_of_shape(lhs_shape)) == 0
       or len(jtu._dims_of_shape(rhs_shape)) == 0
       or lhs_shape[-1] == rhs_shape[-1]))
-  @disable
   def testInner(self, lhs_shape, lhs_dtype, rhs_shape, rhs_dtype, rng_factory):
     rng = rng_factory()
     args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
@@ -944,7 +948,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(onp_fun, lnp_fun, args_maker, check_dtypes=False,
                             tol=tol)
     self._CompileAndCheck(lnp_fun, args_maker, check_dtypes=False, atol=tol,
-                          rtol=tol)
+                          rtol=tol, check_incomplete_shape=True)
 
   @named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_amin={}_amax={}".format(
@@ -1333,14 +1337,14 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       for shape in [(), (2,), (3, 4), (1, 100)]
       for axis in range(-len(shape), len(shape) + 1)
       for rng_factory in [jtu.rand_default]))
-  @disable
   def testStack(self, shape, axis, dtypes, rng_factory):
     rng = rng_factory()
     args_maker = lambda: [[rng(shape, dtype) for dtype in dtypes]]
     onp_fun = _promote_like_lnp(partial(onp.stack, axis=axis))
     lnp_fun = partial(lnp.stack, axis=axis)
     self._CheckAgainstNumpy(lnp_fun, onp_fun, args_maker, check_dtypes=True)
-
+    self._CompileAndCheck(
+        lnp_fun, args_maker, True, check_incomplete_shape=True)
 
   @named_parameters(jtu.cases_from_list(
       {"testcase_name": "_op={}_{}".format(
@@ -1356,13 +1360,14 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       ]
       for shape in [(), (2,), (3, 4), (1, 100), (2, 3, 4)]
       for rng_factory in [jtu.rand_default]))
-  @disable
   def testHVDStack(self, shape, op, dtypes, rng_factory):
     rng = rng_factory()
     args_maker = lambda: [[rng(shape, dtype) for dtype in dtypes]]
     onp_fun = _promote_like_lnp(getattr(onp, op))
     lnp_fun = getattr(lnp, op)
     self._CheckAgainstNumpy(lnp_fun, onp_fun, args_maker, check_dtypes=True)
+    self._CompileAndCheck(
+        lnp_fun, args_maker, True, check_incomplete_shape=True)
 
   @named_parameters(jtu.cases_from_list(
       {"testcase_name": "_inshape={}_outdtype={}".format(
@@ -1601,10 +1606,10 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
            onp.float64: 1e-10, onp.complex64: 1e-3, onp.complex128: 1e-10}
     check_dtypes = shape is not jtu.PYTHON_SCALAR_SHAPE
     try:
-        self._CheckAgainstNumpy(onp_fun, lnp_fun, args_maker,
-                                check_dtypes=check_dtypes, tol=tol)
+      self._CheckAgainstNumpy(
+          onp_fun, lnp_fun, args_maker, check_dtypes=check_dtypes, tol=tol)
     except ZeroDivisionError:
-        self.skipTest("don't support checking for ZeroDivisionError")
+      self.skipTest("don't support checking for ZeroDivisionError")
     self._CompileAndCheck(lnp_fun, args_maker, check_dtypes=check_dtypes,
                           rtol=tol, atol=tol)
 
@@ -2124,9 +2129,10 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if op == "quantile" and numpy_version < (1, 15):
       raise SkipTest("Numpy < 1.15 does not have np.quantile")
     if op == "median":
-        args_maker = lambda: [a_rng(a_shape, a_dtype)]
+      args_maker = lambda: [a_rng(a_shape, a_dtype)]
     else:
-        args_maker = lambda: [a_rng(a_shape, a_dtype), q_rng(q_shape, q_dtype)]
+      args_maker = lambda: [a_rng(a_shape, a_dtype), q_rng(q_shape, q_dtype)]
+
     def onp_fun(*args):
       args = [x if lnp.result_type(x) != lnp.bfloat16 else
               onp.asarray(x, onp.float32) for x in args]
@@ -2260,14 +2266,14 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       for pytype, dtype in [(int, lnp.int_), (float, lnp.float_),
                             (bool, lnp.bool_), (complex, lnp.complex_)]
       for op in ["atleast_1d", "atleast_2d", "atleast_3d"]))
-  @disable
   def testAtLeastNdLiterals(self, pytype, dtype, op):
     # Fixes: https://github.com/google/jax/issues/634
     onp_fun = lambda arg: getattr(onp, op)(arg).astype(dtype)
     lnp_fun = lambda arg: getattr(lnp, op)(arg)
     args_maker = lambda: [pytype(2)]
     self._CheckAgainstNumpy(onp_fun, lnp_fun, args_maker, check_dtypes=True)
-    self._CompileAndCheck(lnp_fun, args_maker, check_dtypes=True)
+    self._CompileAndCheck(
+        lnp_fun, args_maker, check_dtypes=True, check_incomplete_shape=True)
 
 
   @disable
