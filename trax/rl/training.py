@@ -237,7 +237,7 @@ class PolicyTrainer(RLTrainer):
     """Use self.task to create inputs to the policy model."""
     return NotImplementedError
 
-  def policy(self, trajectory):
+  def policy(self, trajectory, temperature=1.0):
     """Chooses an action to play after a trajectory."""
     model = self._policy_eval_model
     model.weights = self._policy_trainer.model_weights
@@ -247,7 +247,7 @@ class PolicyTrainer(RLTrainer):
     pred = model(trajectory_np.observations[None, ...], n_accelerators=1)
     # Pick element 0 from the batch (the only one), last (current) timestep.
     pred = pred[0, -1, :]
-    sample = self._policy_dist.sample(pred)
+    sample = self._policy_dist.sample(pred, temperature)
     log_prob = self._policy_dist.log_prob(pred, sample)
     return (sample.copy(), log_prob.copy())
 
