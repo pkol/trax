@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import collections
 import functools
+import gzip as gzip_lib
 import itertools
 import os
 import pickle
@@ -224,7 +225,12 @@ class Trainer(object):
 
   @model_weights.setter
   def model_weights(self, weights):
-    self._opt_state.weights[0] = self._for_n_devices(weights)
+    new_model_weights = self._for_n_devices(weights)
+    if isinstance(self._opt_state.weights, list):
+      self._opt_state.weights[0] = new_model_weights
+    else:  # weights are a tuple, need to re-create
+      new_weights = [new_model_weights] + list(self._opt_state.weights[1:])
+      self._opt_state = self._opt_state._replace(weights=new_weights)
 
   @property
   def state(self):
@@ -435,8 +441,7 @@ class Trainer(object):
               jaxboard.markdownify_operative_config_str(config_str))
 
   def _save_state_dict(self, trainer_state_dict, weights_file):
-    with tf.io.gfile.GFile(weights_file, 'wb') as f:
-      pickle.dump(trainer_state_dict, f)
+    pickle_to_file(trainer_state_dict, weights_file)
     log('Model saved to %s' % weights_file, stdout=False)
 
   def save_state(self, keep, prefix='model'):
@@ -682,23 +687,27 @@ def train(output_dir,
   trainer.log_step('Starting training using %d devices' % trainer.n_devices)
   trainer.print_n_weights()
 
-  for epoch_steps in epochs(steps, trainer.step, epoch_steps):
-    trainer.train_epoch(epoch_steps, eval_steps)
+  try:
+    for epoch_steps in epochs(steps, trainer.step, epoch_steps):
+      trainer.train_epoch(epoch_steps, eval_steps)
 
-    # Update nontrainable parameters with new history
-    trainer.update_nontrainable_params()
+      # Update nontrainable parameters with new history
+      trainer.update_nontrainable_params()
 
-    # Bookkeeping we do at the first step
-    if trainer.step == 1:
-      # Save computation graph (single-device only for now)
-      if (save_graphs and math.backend_name() == 'jax'):
-        trainer.save_computation_graphs(save_backward_graph)
+      # Bookkeeping we do at the first step
+      if trainer.step == 1:
+        # Save computation graph (single-device only for now)
+        if (save_graphs and math.backend_name() == 'jax'):
+          trainer.save_computation_graphs(save_backward_graph)
 
-      # Save Gin config
-      trainer.save_gin()
+        # Save Gin config
+        trainer.save_gin()
 
-  trainer.log_step('Training done')
-  trainer.close()
+    trainer.log_step('Training done')
+  except Exception as e:
+    raise e
+  finally:
+    trainer.close()
   return trainer.state
 
 
@@ -961,3 +970,28 @@ def _repeat_stream(stream, n_devices):
   while True:
     for example in stream(n_devices):
       yield example
+
+
+def pickle_to_file(obj, file_path, gzip=False):
+  """Pickle obj to file_path with gzipping and failure protection."""
+  # Pickle to tmp file and overwrite to prevent writing partial files.
+  tmp_file_path = file_path + '._tmp_'
+  with tf.io.gfile.GFile(tmp_file_path, 'wb') as f:
+    if not gzip:
+      pickle.dump(obj, f)
+    else:
+      with gzip_lib.GzipFile(fileobj=f, compresslevel=2) as gzipf:
+        pickle.dump(obj, gzipf)
+  # Moving a file is much less error-prone than pickling large files.
+  tf.io.gfile.rename(tmp_file_path, file_path, overwrite=True)
+
+
+def unpickle_from_file(file_path, gzip=False):
+  """Unpickle obj from file_path with gzipping."""
+  with tf.io.gfile.GFile(file_path, 'rb') as f:
+    if not gzip:
+      obj = pickle.load(f)
+    else:
+      with gzip_lib.GzipFile(fileobj=f, compresslevel=2) as gzipf:
+        obj = pickle.load(gzipf)
+  return obj

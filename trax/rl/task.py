@@ -17,11 +17,13 @@
 """Classes for defining RL tasks in Trax."""
 
 import collections
-import pickle
+import os
+
 import gin
 import gym
 import numpy as np
-import tensorflow as tf
+
+from trax.supervised import trainer_lib
 
 
 class _TimeStep(object):
@@ -235,7 +237,8 @@ class RLTask:
   """A RL task: environment and a collection of trajectories."""
 
   def __init__(self, env=gin.REQUIRED, initial_trajectories=1, gamma=0.99,
-               dm_suite=False, max_steps=None, timestep_to_np=None):
+               dm_suite=False, max_steps=None,
+               timestep_to_np=None, num_stacked_frames=1):
     r"""Configures a RL task.
 
     Args:
@@ -251,7 +254,7 @@ class RLTask:
         (ie., a tensor); if None, we just use the state of the timestep to
         represent it, but other representations (such as embeddings that include
         actions or serialized representations) can be passed here.
-
+      num_stacked_frames: the number of stacked frames for Atari.
     """
     if isinstance(env, str):
       self._env_name = env
@@ -263,7 +266,8 @@ class RLTask:
                 'interleaved_pixels': True,
                 'zero_indexed_actions': True
             })
-        env = atari_wrapper.AtariWrapper(environment=env, num_stacked_frames=1)
+        env = atari_wrapper.AtariWrapper(environment=env,
+                                         num_stacked_frames=num_stacked_frames)
       else:
         env = gym.make(env)
     else:
@@ -286,6 +290,9 @@ class RLTask:
     # saving and reading trajectories from disk.
     self._trajectories = collections.defaultdict(list)
     self._trajectories.update(initial_trajectories)
+    # When we repeatedly save, trajectories for many epochs do not change, so
+    # we don't need to save them again. This keeps track which are unchanged.
+    self._saved_epochs_unchanged = []
 
   @property
   def env(self):
@@ -328,19 +335,39 @@ class RLTask:
   def timestep_to_np(self, ts):
     self._timestep_to_np = ts
 
+  def _epoch_filename(self, base_filename, epoch):
+    """Helper function: file name for saving the given epoch."""
+    # If base is /foo/task.pkl, we save epoch 1 under /foo/task_epoch1.pkl.
+    filename, ext = os.path.splitext(base_filename)
+    return filename + '_epoch' + str(epoch) + ext
+
   def init_from_file(self, file_name):
-    with tf.io.gfile.GFile(file_name, 'rb') as f:
-      dictionary = pickle.load(f)
-    self._trajectories = dictionary['trajectories']
+    """Initialize this task from file."""
+    dictionary = trainer_lib.unpickle_from_file(file_name, gzip=False)
     self._max_steps = dictionary['max_steps']
     self._gamma = dictionary['gamma']
+    epochs_to_load = dictionary['all_epochs']
+    for epoch in epochs_to_load:
+      trajectories = trainer_lib.unpickle_from_file(
+          self._epoch_filename(file_name, epoch), gzip=True)
+      self._trajectories[epoch] = trajectories
+    self._saved_epochs_unchanged = epochs_to_load
 
   def save_to_file(self, file_name):
-    dictionary = {'trajectories': self._trajectories,
-                  'max_steps': self._max_steps,
-                  'gamma': self._gamma}
-    with tf.io.gfile.GFile(file_name, 'wb') as f:
-      pickle.dump(dictionary, f)
+    """Save this task to file."""
+    # Save trajectories from new epochs first.
+    epochs_to_save = [e for e in self._trajectories.keys()
+                      if e not in self._saved_epochs_unchanged]
+    for epoch in epochs_to_save:
+      trainer_lib.pickle_to_file(self._trajectories[epoch],
+                                 self._epoch_filename(file_name, epoch),
+                                 gzip=True)
+    # Now save the list of epochs (so the trajectories are already there,
+    # even in case of preemption).
+    dictionary = {'max_steps': self._max_steps,
+                  'gamma': self._gamma,
+                  'all_epochs': list(self._trajectories.keys())}
+    trainer_lib.pickle_to_file(dictionary, file_name, gzip=False)
 
   def play(self, policy):
     """Play an episode in env taking actions according to the given policy."""
@@ -352,8 +379,24 @@ class RLTask:
     """Collect n trajectories in env playing the given policy."""
     new_trajectories = [self.play(policy) for _ in range(n)]
     self._trajectories[epoch_id].extend(new_trajectories)
+    # Mark that epoch epoch_id has changed.
+    if epoch_id in self._saved_epochs_unchanged:
+      self._saved_epochs_unchanged = [e for e in self._saved_epochs_unchanged
+                                      if e != epoch_id]
+    # Calculate returns.
     returns = [t.total_return for t in new_trajectories]
     return sum(returns) / float(len(returns))
+
+  def n_trajectories(self, epochs=None):
+    all_epochs = list(self._trajectories.keys())
+    epoch_indices = epochs or all_epochs
+    return sum([len(self._trajectories[ep]) for ep in epoch_indices])
+
+  def n_interactions(self, epochs=None):
+    all_epochs = list(self._trajectories.keys())
+    epoch_indices = epochs or all_epochs
+    return sum([sum([len(traj) for traj in self._trajectories[ep]])
+                for ep in epoch_indices])
 
   def trajectory_stream(self, epochs=None, max_slice_length=None,
                         include_final_state=False,
